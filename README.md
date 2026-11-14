@@ -56,7 +56,7 @@ which is executed with root privileges. It is responsible for launching
 Run the script with Python 3.8 or newer, passing the IP address of your TV:
 
 ```bash
-python slopbro.py [--debug] [--curl-insecure] [--fake-service-path <PATH>|--no-fake-service-path] [--local-ip <LOCAL IP>] [--webos-version <VERSION>] [--asset-source <auto|dir|embedded>] [--test-server <simple|payload>] [<TV IP ADDRESS>]
+python slopbro.py [--debug] [--curl-insecure] [--fake-service-path <PATH>|--no-fake-service-path] [--local-ip <LOCAL IP>] [--webos-version <VERSION>] [--asset-source <auto|dir|embedded>] [--hbchannel-ipk <PATH>] [--test-server <simple|payload>] [<TV IP ADDRESS>]
 ```
 
 Use `python3 slopbro.py --help` for the full option reference.
@@ -91,6 +91,10 @@ the selected app fails.*
 The `--asset-source` option allows you to specify where the script should look
 for assets (`auto`, `dir`, `embedded`).
 
+The `--hbchannel-ipk <PATH>` option serves a Homebrew Channel IPK you've
+already downloaded on the host, instead of having the TV fetch it from
+`github.com`. See "Offline / no TV internet access" below.
+
 The `--test-server` option starts the local HTTP server and prints its URL
 instead of connecting to the TV over SSAP, so you can test connectivity
 manually by opening the URL in a browser. It doesn't pair with or launch
@@ -103,6 +107,22 @@ LAN-facing local IP, which may be wrong. Two modes are available:
 - `payload`: serves the real exploit/payload files (same as a normal run)
   without doing any SSAP pairing or launching, so you can load `index.html`
   directly in a browser to examine the payload itself.
+
+### Offline / no TV internet access
+
+By default, `autoroot.sh` (running on the TV) downloads the Homebrew Channel
+IPK from `github.com`. If the TV is on a network with no outside access, pass
+`--hbchannel-ipk <path>` and SlopBro will serve that file to the TV itself, so
+the TV never needs to reach the internet:
+
+```bash
+curl -LO https://github.com/webosbrew/webos-homebrew-channel/releases/download/v0.7.3/org.webosbrew.hbchannel_0.7.3_all.ipk
+python3 slopbro.py --hbchannel-ipk org.webosbrew.hbchannel_0.7.3_all.ipk --local-ip <HOST IP> <TV IP ADDRESS>
+```
+
+Just make sure the host can reach the TV on TCP 3001 (SSAP), and the TV can
+reach the host back on whatever port the local HTTP server picks (printed at
+startup; 8080 by default).
 
 ## Packaging
 

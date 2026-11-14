@@ -22,6 +22,7 @@ class CommandLineTests(unittest.TestCase):
             "tv.local", debug=False, asset_source="auto",
             local_ip_override=None, webos_version_override=None,
             curl_insecure=False, fake_service_path=slopbro.DEFAULT_FAKE_SERVICE_PATH,
+            hbchannel_ipk=None,
         )
         self.runners["run_test_connection"].assert_not_called()
         self.runners["run_test_payload"].assert_not_called()
@@ -40,6 +41,7 @@ class CommandLineTests(unittest.TestCase):
                 "tv.local", debug=True, asset_source="dir",
                 local_ip_override="192.168.1.2", webos_version_override="6.5",
                 curl_insecure=True, fake_service_path=slopbro.DEFAULT_FAKE_SERVICE_PATH,
+                hbchannel_ipk=None,
             )
 
     def test_fake_service_path_options(self):
@@ -64,7 +66,7 @@ class CommandLineTests(unittest.TestCase):
             positional = [host] if host else []
             self.assertEqual(slopbro.main(["--test-server", "simple"] + positional), 0)
             self.runners["run_test_connection"].assert_called_with(
-                host, local_ip_override=None,
+                host, local_ip_override=None, hbchannel_ipk=None,
             )
             self.assertEqual(slopbro.main([
                 "--test-server=payload", "--debug", "--curl-insecure",
@@ -74,6 +76,7 @@ class CommandLineTests(unittest.TestCase):
                 host, debug=True, asset_source="embedded",
                 local_ip_override="192.168.1.2", curl_insecure=True,
                 fake_service_path=slopbro.DEFAULT_FAKE_SERVICE_PATH,
+                hbchannel_ipk=None,
             )
         self.runners["run"].assert_not_called()
 
@@ -125,6 +128,7 @@ class HandlerTests(unittest.TestCase):
         root_dir=None,
         allow_embedded_assets=True,
         allow_filesystem_fallback=False,
+        extra_files=None,
     ):
         tracker = tracker or Mock()
         handler_class = slopbro.make_tracking_handler(
@@ -133,6 +137,7 @@ class HandlerTests(unittest.TestCase):
             tracked_files,
             allow_embedded_assets,
             allow_filesystem_fallback,
+            extra_files=extra_files,
         )
         handler = object.__new__(handler_class)
         handler.path = path
@@ -367,6 +372,34 @@ class HandlerTests(unittest.TestCase):
         self.assertEqual(source.read(), b"let x = 1;")
         source.close()
 
+    def test_extra_files_are_served_and_tracked(self):
+        tracker = slopbro.RequestedFilesTracker(["hbchannel.ipk"])
+        handler, _ = self._make_tracking_handler(
+            "/hbchannel.ipk",
+            tracker=tracker,
+            tracked_files=("hbchannel.ipk",),
+            extra_files={"hbchannel.ipk": b"!<arch>\ndata"},
+        )
+        with patch.object(slopbro, "_read_embedded_file") as embedded:
+            with patch.object(slopbro, "log"):
+                handler.do_GET()
+        embedded.assert_not_called()
+        self.assertEqual(handler.wfile.getvalue(), b"!<arch>\ndata")
+        self.assertEqual(tracker.missing_files(), [])
+
+    def test_extra_files_take_priority_over_embedded_and_filesystem(self):
+        handler, _ = self._make_tracking_handler(
+            "/hbchannel.ipk",
+            tracked_files=("hbchannel.ipk",),
+            allow_filesystem_fallback=True,
+            extra_files={"hbchannel.ipk": b"from-extra"},
+        )
+        with patch.object(slopbro, "_read_embedded_file", return_value=b"from-embedded"):
+            with patch.object(slopbro, "_read_filesystem_file", return_value=b"from-fs"):
+                source = handler.send_head()
+        self.assertEqual(source.read(), b"from-extra")
+        source.close()
+
     def test_simple_server_get_and_head_responses(self):
         handler_class = slopbro.make_test_connection_handler()
         get_handler = object.__new__(handler_class)
@@ -411,6 +444,90 @@ class HandlerTests(unittest.TestCase):
         with patch.object(slopbro, "log") as logger:
             handler.log_message("status %s", 200)
         logger.assert_called_once_with("request from 127.0.0.1: status 200")
+
+
+class HbchannelIpkTests(unittest.TestCase):
+    def test_load_hbchannel_ipk_rejects_missing_file(self):
+        with patch.object(slopbro, "die", side_effect=SystemExit(1)) as die:
+            with self.assertRaises(SystemExit):
+                slopbro.load_hbchannel_ipk("/nonexistent/path/hbchannel.ipk")
+        self.assertIn("could not read", die.call_args.args[0])
+
+    def test_load_hbchannel_ipk_rejects_bad_magic(self):
+        with tempfile.NamedTemporaryFile(delete=False) as f:
+            f.write(b"<html>not an ipk</html>")
+            path = f.name
+        try:
+            with patch.object(slopbro, "die", side_effect=SystemExit(1)) as die:
+                with self.assertRaises(SystemExit):
+                    slopbro.load_hbchannel_ipk(path)
+            self.assertIn("not an IPK", die.call_args.args[0])
+        finally:
+            os.unlink(path)
+
+    def test_load_hbchannel_ipk_rejects_empty_file(self):
+        with tempfile.NamedTemporaryFile(delete=False) as f:
+            path = f.name
+        try:
+            with patch.object(slopbro, "die", side_effect=SystemExit(1)) as die:
+                with self.assertRaises(SystemExit):
+                    slopbro.load_hbchannel_ipk(path)
+            self.assertIn("empty", die.call_args.args[0])
+        finally:
+            os.unlink(path)
+
+    def test_load_hbchannel_ipk_accepts_valid_ipk(self):
+        with tempfile.NamedTemporaryFile(delete=False) as f:
+            f.write(b"!<arch>\nrest-of-ipk-data")
+            path = f.name
+        try:
+            data = slopbro.load_hbchannel_ipk(path)
+            self.assertEqual(data, b"!<arch>\nrest-of-ipk-data")
+        finally:
+            os.unlink(path)
+
+    def test_build_self_hosted_url_includes_service_files(self):
+        url = slopbro.build_self_hosted_url(
+            "tv.local", 8080, local_ip_override="192.168.1.5",
+            service_files=slopbro.SERVICE_FILES + [slopbro.HBCHANNEL_IPK],
+        )
+        self.assertIn("files=package.json;main.js;hbchannel.ipk", url)
+
+    def test_build_self_hosted_url_defaults_to_service_files(self):
+        url = slopbro.build_self_hosted_url(
+            "tv.local", 8080, local_ip_override="192.168.1.5",
+        )
+        self.assertIn("files=package.json;main.js", url)
+        self.assertNotIn("hbchannel.ipk", url)
+
+    def test_main_passes_hbchannel_ipk_through(self):
+        for name in ("run", "run_test_connection", "run_test_payload"):
+            patcher = patch.object(slopbro, name)
+            self.addCleanup(patcher.stop)
+            patcher.start()
+
+        self.assertEqual(
+            slopbro.main(["--hbchannel-ipk", "/tmp/hbc.ipk", "tv.local"]), 0,
+        )
+        self.assertEqual(
+            slopbro.run.call_args.kwargs["hbchannel_ipk"], "/tmp/hbc.ipk",
+        )
+
+        self.assertEqual(slopbro.main([
+            "--test-server=payload", "--hbchannel-ipk=/tmp/hbc.ipk",
+        ]), 0)
+        self.assertEqual(
+            slopbro.run_test_payload.call_args.kwargs["hbchannel_ipk"],
+            "/tmp/hbc.ipk",
+        )
+
+        self.assertEqual(slopbro.main([
+            "--test-server=simple", "--hbchannel-ipk=/tmp/hbc.ipk",
+        ]), 0)
+        self.assertEqual(
+            slopbro.run_test_connection.call_args.kwargs["hbchannel_ipk"],
+            "/tmp/hbc.ipk",
+        )
 
 
 class Python3CleanupTests(unittest.TestCase):
