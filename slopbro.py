@@ -31,7 +31,7 @@ import struct
 import sys
 import threading
 import time
-from hashlib import sha1
+from hashlib import sha1, sha256
 from http.server import BaseHTTPRequestHandler, HTTPServer, SimpleHTTPRequestHandler
 from urllib.parse import unquote, urlsplit
 
@@ -64,6 +64,8 @@ SERVICE_FILES = [
     "package.json",
     "main.js",
 ]
+HBCHANNEL_IPK = "hbchannel.ipk"
+IPK_MAGIC = b"!<arch>\n"
 
 ASSET_SOURCE_AUTO = "auto"
 ASSET_SOURCE_DIR = "dir"
@@ -708,13 +710,39 @@ class RequestedFilesTracker:
             return len(self._tracked)
 
 
+def load_hbchannel_ipk(path):
+    """Read and sanity-check a Homebrew Channel IPK; die on any problem."""
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except OSError as exc:
+        die("could not read --hbchannel-ipk file '%s': %s" % (path, exc))
+    if not data:
+        die("--hbchannel-ipk file '%s' is empty" % path)
+    if not data.startswith(IPK_MAGIC):
+        die(
+            "--hbchannel-ipk file '%s' is not an IPK (missing '!<arch>' "
+            "header; was an error page saved by mistake?)" % path
+        )
+    return data
+
+
+def describe_hbchannel_ipk(path, data):
+    log(
+        "Homebrew Channel IPK: %s (%d bytes, sha256 %s)"
+        % (path, len(data), sha256(data).hexdigest())
+    )
+
+
 def make_tracking_handler(
     root_dir,
     tracker,
     tracked_files,
     allow_embedded_assets,
     allow_filesystem_fallback,
+    extra_files=None,
 ):
+    extra_files = dict(extra_files or {})
     tracked = set(tracked_files)
 
     class TrackingHTTPRequestHandler(SimpleHTTPRequestHandler):
@@ -755,8 +783,8 @@ def make_tracking_handler(
                 self.send_error(404, "File not found")
                 return None
 
-            data = None
-            if allow_embedded_assets:
+            data = extra_files.get(rel_path)
+            if data is None and allow_embedded_assets:
                 data = _read_embedded_file(rel_path)
             if data is None and allow_filesystem_fallback:
                 data = _read_filesystem_file(root_dir, rel_path)
@@ -786,6 +814,7 @@ def start_http_server(
     allow_filesystem_fallback,
     bind_host="0.0.0.0",
     preferred_port=8080,
+    extra_files=None,
 ):
     """Start a tiny static file server rooted at root_dir."""
     handler = make_tracking_handler(
@@ -794,6 +823,7 @@ def start_http_server(
         tracked_files,
         allow_embedded_assets,
         allow_filesystem_fallback,
+        extra_files=extra_files,
     )
     return _start_http_server(handler, bind_host, preferred_port)
 
@@ -821,10 +851,11 @@ def build_self_hosted_url(
     local_ip_override=None,
     curl_insecure=False,
     fake_service_path=DEFAULT_FAKE_SERVICE_PATH,
+    service_files=SERVICE_FILES,
 ):
     local_ip = local_ip_override or local_ip_for_remote(tv_host)
     url = "http://%s:%d/%s" % (local_ip, server_port, ENTRY_PAGE)
-    url += "?script=%s&files=%s" % (SHELL_SCRIPT, ";".join(SERVICE_FILES))
+    url += "?script=%s&files=%s" % (SHELL_SCRIPT, ";".join(service_files))
     if debug:
         url += "&debug"
     if curl_insecure:
@@ -879,7 +910,7 @@ def start_test_connection_server(bind_host="0.0.0.0", preferred_port=8080):
     return _start_http_server(handler, bind_host, preferred_port)
 
 
-def run_test_connection(host=None, local_ip_override=None):
+def run_test_connection(host=None, local_ip_override=None, hbchannel_ipk=None):
     """Serve a fixed plain-text response to test basic HTTP connectivity only.
 
     Doesn't serve the real payload/exploit files and doesn't perform any SSAP
@@ -891,6 +922,13 @@ def run_test_connection(host=None, local_ip_override=None):
         log(
             "warning: no <tv-ip-or-host> given; the guessed local IP may be "
             "wrong (recommended: pass the TV's IP address)"
+        )
+
+    if hbchannel_ipk:
+        describe_hbchannel_ipk(hbchannel_ipk, load_hbchannel_ipk(hbchannel_ipk))
+        log(
+            "note: simple mode doesn't serve the IPK; use "
+            "--test-server payload to test serving it"
         )
 
     http_server = None
@@ -933,6 +971,7 @@ def run_test_payload(
     local_ip_override=None,
     curl_insecure=False,
     fake_service_path=DEFAULT_FAKE_SERVICE_PATH,
+    hbchannel_ipk=None,
 ):
     """Serve the payload page and print its URL without pairing/launching.
 
@@ -948,12 +987,18 @@ def run_test_payload(
         )
 
     tracked_files = required_files()
+    extra_files = {}
+    service_files = list(SERVICE_FILES)
+    if hbchannel_ipk:
+        extra_files[HBCHANNEL_IPK] = load_hbchannel_ipk(hbchannel_ipk)
+        service_files.append(HBCHANNEL_IPK)
     wwwroot_dir = None
     asset_source_used = None
     allow_embedded_assets = True
     allow_filesystem_fallback = True
     http_server = None
     page_url = None
+    local_ip = None
     try:
         (
             wwwroot_dir,
@@ -964,14 +1009,15 @@ def run_test_payload(
     except RuntimeError as exc:
         die("%s" % exc)
 
-    tracker = RequestedFilesTracker(tracked_files)
+    tracker = RequestedFilesTracker(tracked_files + list(extra_files))
     try:
         http_server = start_http_server(
             wwwroot_dir,
             tracker,
-            tracked_files,
+            tracked_files + list(extra_files),
             allow_embedded_assets,
             allow_filesystem_fallback,
+            extra_files=extra_files,
         )
         local_ip = guess_local_ip(
             target_host=host, local_ip_override=local_ip_override
@@ -983,6 +1029,7 @@ def run_test_payload(
             curl_insecure=curl_insecure,
             local_ip_override=local_ip,
             fake_service_path=fake_service_path,
+            service_files=service_files,
         )
     except Exception as exc:
         die("could not start self-hosted page server: %s" % exc)
@@ -991,6 +1038,17 @@ def run_test_payload(
         "test mode: serving files from %s (source=%s)"
         % (wwwroot_dir, asset_source_used)
     )
+    if hbchannel_ipk:
+        describe_hbchannel_ipk(hbchannel_ipk, extra_files[HBCHANNEL_IPK])
+        log(
+            "Homebrew Channel IPK direct URL: http://%s:%d/%s"
+            % (local_ip, http_server.server_port, HBCHANNEL_IPK)
+        )
+    else:
+        log(
+            "note: no --hbchannel-ipk given; the TV will try to download "
+            "Homebrew Channel from github.com (needs internet access)"
+        )
     log("open this URL in the TV's web browser to test the payload:")
     log("    %s" % page_url)
     log("press Ctrl+C to stop")
@@ -1020,6 +1078,7 @@ def run(
     webos_version_override=None,
     curl_insecure=False,
     fake_service_path=DEFAULT_FAKE_SERVICE_PATH,
+    hbchannel_ipk=None,
 ):
     secure = True
     port = PORT_TLS if secure else PORT_PLAIN
@@ -1027,6 +1086,12 @@ def run(
     log("connecting to %s://%s:%d" % (scheme, host, port))
 
     tracked_files = required_files()
+    extra_files = {}
+    service_files = list(SERVICE_FILES)
+    if hbchannel_ipk:
+        extra_files[HBCHANNEL_IPK] = load_hbchannel_ipk(hbchannel_ipk)
+        service_files.append(HBCHANNEL_IPK)
+        describe_hbchannel_ipk(hbchannel_ipk, extra_files[HBCHANNEL_IPK])
     wwwroot_dir = None
     asset_source_used = None
     allow_embedded_assets = True
@@ -1049,11 +1114,12 @@ def run(
     except RuntimeError as exc:
         die("%s" % exc)
 
-    tracker = RequestedFilesTracker(tracked_files)
+    all_tracked = tracked_files + list(extra_files)
+    tracker = RequestedFilesTracker(all_tracked)
     if tracked_files:
         log(
             "tracking %d files in %s (source=%s)"
-            % (len(tracked_files), wwwroot_dir, asset_source_used)
+            % (len(all_tracked), wwwroot_dir, asset_source_used)
         )
     else:
         log("warning: no files found in %s" % wwwroot_dir)
@@ -1061,9 +1127,10 @@ def run(
         http_server = start_http_server(
             wwwroot_dir,
             tracker,
-            tracked_files,
+            all_tracked,
             allow_embedded_assets,
             allow_filesystem_fallback,
+            extra_files=extra_files,
         )
         page_url = build_self_hosted_url(
             host,
@@ -1072,6 +1139,7 @@ def run(
             curl_insecure=curl_insecure,
             local_ip_override=local_ip_override,
             fake_service_path=fake_service_path,
+            service_files=service_files,
         )
     except Exception as exc:
         die("could not start self-hosted page server: %s" % exc)
@@ -1193,6 +1261,11 @@ def main(argv=None):
         help="limit target apps by webOS version (e.g. 6.5); not auto-detected",
     )
     parser.add_argument(
+        "--hbchannel-ipk", metavar="<path>",
+        help="serve this Homebrew Channel IPK to the TV instead of "
+             "having the TV download it from github.com",
+    )
+    parser.add_argument(
         "--test-server", choices=TEST_SERVER_MODES,
         help="serve a connectivity response (simple) or payload without pairing",
     )
@@ -1212,6 +1285,7 @@ def main(argv=None):
         run_test_connection(
             args.host,
             local_ip_override=args.local_ip,
+            hbchannel_ipk=args.hbchannel_ipk,
         )
     elif args.test_server == TEST_SERVER_PAYLOAD:
         run_test_payload(
@@ -1221,6 +1295,7 @@ def main(argv=None):
             local_ip_override=args.local_ip,
             curl_insecure=args.curl_insecure,
             fake_service_path=args.fake_service_path,
+            hbchannel_ipk=args.hbchannel_ipk,
         )
     else:
         run(
@@ -1231,6 +1306,7 @@ def main(argv=None):
             webos_version_override=args.webos_version,
             curl_insecure=args.curl_insecure,
             fake_service_path=args.fake_service_path,
+            hbchannel_ipk=args.hbchannel_ipk,
         )
     return 0
 
